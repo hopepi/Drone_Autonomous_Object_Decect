@@ -1,29 +1,31 @@
-# drone_server.py (güvenli ve hataya dayanıklı versiyon)
+# drone_server.py (Picamera2 ile, hataya dayanıklı versiyon)
 import socket
 import struct
-import cv2
 import time
 import json
 import threading
-from flask import Flask, Response, request, jsonify, redirect
+from flask import Flask, request, jsonify, redirect
 import random
 import atexit
 import drone_control
 import control
 import signal
 import sys
+sys.path.append("/usr/lib/python3/dist-packages")
+from picamera2 import Picamera2
+from libcamera import Transform
+import cv2
+import numpy as np
 
 # ---------- AYARLAR ----------
 SERVER_IP = '127.0.0.1'
 SERVER_PORT = 8000
 PC_STREAM_IP = '10.245.198.73'
 PC_STREAM_PORT = 8080
-FPS = 15
+FPS = 7
 FRAME_DELAY = 1 / FPS
 FRAME_WIDTH = 640
 FRAME_HEIGHT = 320
-FRAME_CENTER_X = FRAME_WIDTH // 2
-FRAME_CENTER_Y = FRAME_HEIGHT // 2
 
 # ---------- GLOBAL DEĞİŞKENLER ----------
 latest_frame = None
@@ -31,7 +33,7 @@ hedef_etiketi = None
 drone_state = "land"
 emergency_flag = False
 current_altitude = 1.0
-cap = None
+picam2 = None
 
 # ---------- LOG ----------
 def log(msg, level="info"):
@@ -55,7 +57,7 @@ def land_drone():
 def handle_exit(signum=None, frame=None):
     log("\U0001f6d1 Program sonlandırılıyor, iniş yapılıyor...", "warning")
     land_drone()
-    if cap: cap.release()
+    if picam2: picam2.stop()
     sys.exit(0)
 
 signal.signal(signal.SIGINT, handle_exit)
@@ -64,9 +66,8 @@ atexit.register(land_drone)
 
 # ---------- KAMERA GÖNDERİM VE KOMUT ALIMI ----------
 def send_to_pc():
-    global latest_frame, hedef_etiketi, drone_state, emergency_flag, cap
+    global latest_frame, hedef_etiketi, drone_state, emergency_flag
     last_target_time = time.time()
-
     while True:
         try:
             log("\U0001f501 PC'ye bağlanılıyor...", "warning")
@@ -76,11 +77,8 @@ def send_to_pc():
 
             while True:
                 start_time = time.time()
-                ret, frame = cap.read()
-                if not ret:
-                    log("Kamera verisi okunamadı", "danger")
-                    continue
-
+                frame = picam2.capture_array()
+                frame = cv2.resize(frame, (FRAME_WIDTH, FRAME_HEIGHT))
                 _, img_encoded = cv2.imencode('.jpg', frame)
                 data = img_encoded.tobytes()
                 client_socket.sendall(struct.pack(">L", len(data)) + data)
@@ -134,12 +132,12 @@ def send_to_pc():
                             last_target_time = time.time()
 
                 except json.JSONDecodeError:
-                    log("\u26a0️ Komut JSON hatası!", "danger")
+                    log("⚠️ Komut JSON hatası!", "danger")
 
                 time.sleep(max(0, FRAME_DELAY - (time.time() - start_time)))
 
         except Exception as e:
-            log(f"\u274c Bağlantı hatası: {e}", "danger")
+            log(f"❌ Bağlantı hatası: {e}", "danger")
             try: client_socket.close()
             except: pass
             log("5 saniye sonra yeniden deneniyor...", "warning")
@@ -211,22 +209,28 @@ def resume():
     emergency_flag = False
     land_drone()
     drone_state = "land"
-    log("\u2705 Emergency modu sona erdi", "success")
+    log("✅ Emergency modu sona erdi", "success")
     return jsonify({"status": "Sistem normale döndü"})
 
 # ---------- SETUP ----------
 def setup():
-    global cap
-    cap = cv2.VideoCapture(0)
-    if not cap.isOpened():
-        log("\U0001f4f7 Kamera açılamadı!", "danger")
+    global picam2
+    try:
+        picam2 = Picamera2()
+        picam2_config = picam2.create_video_configuration(
+            main={"size": (FRAME_WIDTH, FRAME_HEIGHT)}, transform=Transform(hflip=1)
+        )
+        picam2.configure(picam2_config)
+        picam2.start()
+        time.sleep(2)
+        log("\U0001f4f7 Picamera2 aktif", "success")
+    except Exception as e:
+        log(f"Kamera hatası: {e}", "danger")
         handle_exit()
-    else:
-        log("\U0001f4f7 Kamera aktif", "success")
 
     try:
         drone_control.connect_drone('/dev/serial0')
-        log("\u2705 Drone bağlandı", "success")
+        log("✅ Drone bağlandı", "success")
     except Exception as e:
         log(f"Drone bağlantı hatası: {e}", "danger")
         handle_exit()
