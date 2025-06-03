@@ -18,7 +18,7 @@ import cv2
 import numpy as np
 
 # ---------- AYARLAR ----------
-SERVER_IP = '127.0.0.1'
+SERVER_IP = '10.245.198.73'
 SERVER_PORT = 8000
 PC_STREAM_IP = '10.245.198.73'
 PC_STREAM_PORT = 8080
@@ -77,18 +77,11 @@ def send_to_pc():
 
             while True:
                 start_time = time.time()
-                frame = picam2.capture_array()
-                frame = cv2.resize(frame, (FRAME_WIDTH, FRAME_HEIGHT))
-                _, img_encoded = cv2.imencode('.jpg', frame)
+                frame = cv2.cvtColor(picam2.capture_array(), cv2.COLOR_RGB2BGR)
+                _, img_encoded = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 60])
                 data = img_encoded.tobytes()
                 client_socket.sendall(struct.pack(">L", len(data)) + data)
                 latest_frame = frame.copy()
-
-                if emergency_flag or drone_state == "emergency":
-                    log("\U0001f6a8 ACİL DURUM: Drone hareketi durduruluyor", "danger")
-                    control.stop_drone()
-                    time.sleep(max(0, FRAME_DELAY - (time.time() - start_time)))
-                    continue
 
                 cmd_len_bytes = client_socket.recv(4)
                 if not cmd_len_bytes:
@@ -110,9 +103,13 @@ def send_to_pc():
                             alan = hedef.get("alan")
 
                             if etiket == "person":
-                                log("‼️ İnsan tespit edildi - kaçın", "danger")
+                                log("‼️ İnsan tespit edildi - asılı kal", "danger")
+                                emergency_flag = True
                                 drone_state = "emergency"
                                 break
+
+                            if emergency_flag:
+                                continue
 
                             if hedef_etiketi and etiket != hedef_etiketi:
                                 continue
@@ -133,6 +130,9 @@ def send_to_pc():
 
                 except json.JSONDecodeError:
                     log("⚠️ Komut JSON hatası!", "danger")
+
+                if emergency_flag or drone_state == "emergency":
+                    control.stop_drone()
 
                 time.sleep(max(0, FRAME_DELAY - (time.time() - start_time)))
 
@@ -194,23 +194,28 @@ def emergency():
     global emergency_flag, drone_state
     emergency_flag = True
     log("‼️ ACİL DURDURMA", "danger")
-    try:
-        control.stop_drone()
-        time.sleep(3)
-        land_drone()
-    except Exception as e:
-        log(f"Emergency hata: {e}", "danger")
+    control.stop_drone()
     drone_state = "emergency"
-    return jsonify({"status": "Drone durdu ve iniyor"})
+    return jsonify({"status": "Drone acil durduruldu, havada asılı kaldı"})
 
 @app.route("/resume", methods=["POST"])
 def resume():
-    global emergency_flag, drone_state
+    global emergency_flag, drone_state, current_altitude, hedef_etiketi
     emergency_flag = False
-    land_drone()
-    drone_state = "land"
     log("✅ Emergency modu sona erdi", "success")
-    return jsonify({"status": "Sistem normale döndü"})
+
+    if hedef_etiketi:
+        try:
+            control.arm_and_takeoff(current_altitude)
+            drone_state = "track"
+            return jsonify({"status": f"Takibe devam ediliyor: {hedef_etiketi}"}), 200
+        except Exception as e:
+            log(f"Kalkış hatası: {e}", "danger")
+            return jsonify({"status": "Kalkış yapılamadı"}), 500
+    else:
+        land_drone()
+        drone_state = "land"
+        return jsonify({"status": "Hedef yok, sadece emergency bitti"}), 200
 
 # ---------- SETUP ----------
 def setup():
@@ -218,7 +223,7 @@ def setup():
     try:
         picam2 = Picamera2()
         picam2_config = picam2.create_video_configuration(
-            main={"size": (FRAME_WIDTH, FRAME_HEIGHT)}, transform=Transform(hflip=1)
+            main={"FrameRate": FPS, "size": (FRAME_WIDTH, FRAME_HEIGHT)}, transform=Transform(hflip=1)
         )
         picam2.configure(picam2_config)
         picam2.start()
@@ -242,4 +247,4 @@ def setup():
 if __name__ == "__main__":
     setup()
     log("\U0001f681 Drone sunucu başlatılıyor...", "info")
-    app.run(host="0.0.0.0", port=5000)
+    app.run(host="0.0.0.0", port=5000, threaded=True)
