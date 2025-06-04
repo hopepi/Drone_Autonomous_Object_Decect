@@ -1,4 +1,4 @@
-# drone_server.py (Picamera2 ile, hataya dayanıklı versiyon)
+# drone_server_v2.py (Picamera2 ile, thread senkronizasyonlu ve hataya dayanıklı versiyon)
 import socket
 import struct
 import time
@@ -11,6 +11,7 @@ import drone_control
 import control
 import signal
 import sys
+from datetime import datetime
 sys.path.append("/usr/lib/python3/dist-packages")
 from picamera2 import Picamera2
 from libcamera import Transform
@@ -34,6 +35,7 @@ drone_state = "land"
 emergency_flag = False
 current_altitude = 1.0
 picam2 = None
+lock = threading.Lock()
 
 # ---------- LOG ----------
 def log(msg, level="info"):
@@ -64,6 +66,23 @@ signal.signal(signal.SIGINT, handle_exit)
 signal.signal(signal.SIGTERM, handle_exit)
 atexit.register(land_drone)
 
+# ---------- KAMERA THREAD ----------
+def update_camera():
+    global latest_frame
+    prev_frame = None
+    while True:
+        try:
+            frame = picam2.capture_image()
+            if frame is None or (prev_frame is not None and np.array_equal(frame, prev_frame)):
+                continue
+            prev_frame = frame.copy()
+            with lock:
+                latest_frame = frame.copy()
+            time.sleep(0.01)
+        except Exception as e:
+            log(f"Kamera yakalama hatası: {e}", "danger")
+            time.sleep(1)
+
 # ---------- KAMERA GÖNDERİM VE KOMUT ALIMI ----------
 def send_to_pc():
     global latest_frame, hedef_etiketi, drone_state, emergency_flag
@@ -77,11 +96,16 @@ def send_to_pc():
 
             while True:
                 start_time = time.time()
-                frame = cv2.cvtColor(picam2.capture_array(), cv2.COLOR_RGB2BGR)
+
+                with lock:
+                    frame = latest_frame.copy() if latest_frame is not None else None
+                if frame is None:
+                    log("\u26a0\ufe0f Kamera görüntüsü alınamadı!", "danger")
+                    continue
+
                 _, img_encoded = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 60])
                 data = img_encoded.tobytes()
                 client_socket.sendall(struct.pack(">L", len(data)) + data)
-                latest_frame = frame.copy()
 
                 cmd_len_bytes = client_socket.recv(4)
                 if not cmd_len_bytes:
@@ -123,13 +147,13 @@ def send_to_pc():
                             break
 
                         if not hedef_bulundu and (time.time() - last_target_time) > 30:
-                            log("⏳ 30 sn hedef yok - iniliyor", "warning")
+                            log("\u23f3 30 sn hedef yok - iniliyor", "warning")
                             land_drone()
                             drone_state = "land"
                             last_target_time = time.time()
 
                 except json.JSONDecodeError:
-                    log("⚠️ Komut JSON hatası!", "danger")
+                    log("\u26a0\ufe0f Komut JSON hatası!", "danger")
 
                 if emergency_flag or drone_state == "emergency":
                     control.stop_drone()
@@ -222,10 +246,12 @@ def setup():
     global picam2
     try:
         picam2 = Picamera2()
-        picam2_config = picam2.create_video_configuration(
-            main={"FrameRate": FPS, "size": (FRAME_WIDTH, FRAME_HEIGHT)}, transform=Transform(hflip=1)
+        config = picam2.create_video_configuration(
+            main={"size": (FRAME_WIDTH, FRAME_HEIGHT), "format": "RGB888"},
+            transform=Transform(hflip=1)
         )
-        picam2.configure(picam2_config)
+        picam2.configure(config)
+        picam2.set_controls({"FrameRate": 10})
         picam2.start()
         time.sleep(2)
         log("\U0001f4f7 Picamera2 aktif", "success")
@@ -241,6 +267,7 @@ def setup():
         handle_exit()
 
     control.configure_PID()
+    threading.Thread(target=update_camera, daemon=True).start()
     threading.Thread(target=send_to_pc, daemon=True).start()
 
 # ---------- MAIN ----------
