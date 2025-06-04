@@ -1,4 +1,4 @@
-# drone_server_v2.py (Picamera2 ile, thread senkronizasyonlu ve hataya dayanıklı versiyon)
+# drone_server_v2.py (FPS hatası giderilmiş stabil sürüm)
 import socket
 import struct
 import time
@@ -36,28 +36,35 @@ emergency_flag = False
 current_altitude = 1.0
 picam2 = None
 lock = threading.Lock()
+system_ready = False
 
 # ---------- LOG ----------
+def log_to_file(msg):
+    with open("drone_server.log", "a") as f:
+        f.write(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+
 def log(msg, level="info"):
     renk = {
         "info": "\033[94m[INFO] ", "warning": "\033[93m[WARN] ",
         "danger": "\033[91m[ERROR] ", "success": "\033[92m[SUCCESS] ",
         "end": "\033[0m"
     }
-    print(f"{renk.get(level, '')}{msg}{renk['end']}")
+    formatted = f"{renk.get(level, '')}{msg}{renk['end']}"
+    print(formatted)
+    log_to_file(f"[{level.upper()}] {msg}")
 
-# ---------- ACİL DURUM VE GÜVENLİ ÇIKIŞ ----------
+# ---------- ACİL DURUM ----------
 def land_drone():
     global current_altitude
     try:
-        log("\U0001f6ec Drone iniş yapıyor...", "danger")
+        log("🛬 Drone iniş yapıyor...", "danger")
         control.land()
         current_altitude = 0.0
     except Exception as e:
         log(f"Drone iniş hatası: {e}", "danger")
 
 def handle_exit(signum=None, frame=None):
-    log("\U0001f6d1 Program sonlandırılıyor, iniş yapılıyor...", "warning")
+    log("🛑 Program sonlandırılıyor, iniş yapılıyor...", "warning")
     land_drone()
     if picam2: picam2.stop()
     sys.exit(0)
@@ -72,7 +79,7 @@ def update_camera():
     prev_frame = None
     while True:
         try:
-            frame = picam2.capture_image()
+            frame = picam2.capture_array()
             if frame is None or (prev_frame is not None and np.array_equal(frame, prev_frame)):
                 continue
             prev_frame = frame.copy()
@@ -83,24 +90,22 @@ def update_camera():
             log(f"Kamera yakalama hatası: {e}", "danger")
             time.sleep(1)
 
-# ---------- KAMERA GÖNDERİM VE KOMUT ALIMI ----------
+# ---------- PC'ye GÖNDER ----------
 def send_to_pc():
     global latest_frame, hedef_etiketi, drone_state, emergency_flag
     last_target_time = time.time()
     while True:
         try:
-            log("\U0001f501 PC'ye bağlanılıyor...", "warning")
+            log("🔁 PC'ye bağlanılıyor...", "warning")
             client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             client_socket.connect((SERVER_IP, SERVER_PORT))
-            log("\U0001f7e2 Kamera client PC'ye bağlı", "success")
+            log("🟢 Kamera client PC'ye bağlı", "success")
 
             while True:
                 start_time = time.time()
-
                 with lock:
                     frame = latest_frame.copy() if latest_frame is not None else None
                 if frame is None:
-                    log("\u26a0\ufe0f Kamera görüntüsü alınamadı!", "danger")
                     continue
 
                 _, img_encoded = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 60])
@@ -109,13 +114,13 @@ def send_to_pc():
 
                 cmd_len_bytes = client_socket.recv(4)
                 if not cmd_len_bytes:
-                    log("Sunucu komut uzunluğu boş geldi", "danger")
                     break
                 cmd_len = struct.unpack(">L", cmd_len_bytes)[0]
                 command_json = client_socket.recv(cmd_len).decode('utf-8')
 
                 try:
                     command = json.loads(command_json)
+                    log(f"📥 Gelen komut JSON: {command}", "info")
                     if command.get("status") == "hedefler":
                         hedefler = command.get("hedefler", [])
                         hedef_bulundu = False
@@ -127,7 +132,7 @@ def send_to_pc():
                             alan = hedef.get("alan")
 
                             if etiket == "person":
-                                log("‼️ İnsan tespit edildi - asılı kal", "danger")
+                                log("‼️ İnsan tespit edildi - drone durdu", "danger")
                                 emergency_flag = True
                                 drone_state = "emergency"
                                 break
@@ -147,13 +152,13 @@ def send_to_pc():
                             break
 
                         if not hedef_bulundu and (time.time() - last_target_time) > 30:
-                            log("\u23f3 30 sn hedef yok - iniliyor", "warning")
+                            log("⏳ 30 sn hedef yok - iniş", "warning")
                             land_drone()
                             drone_state = "land"
                             last_target_time = time.time()
 
                 except json.JSONDecodeError:
-                    log("\u26a0\ufe0f Komut JSON hatası!", "danger")
+                    log("⚠️ Komut JSON hatası!", "danger")
 
                 if emergency_flag or drone_state == "emergency":
                     control.stop_drone()
@@ -167,7 +172,7 @@ def send_to_pc():
             log("5 saniye sonra yeniden deneniyor...", "warning")
             time.sleep(5)
 
-# ---------- FLASK API ----------
+# ---------- FLASK ----------
 app = Flask(__name__)
 
 @app.route("/stream")
@@ -181,19 +186,23 @@ def ping():
 @app.route("/command", methods=["POST"])
 def command():
     global hedef_etiketi, drone_state, current_altitude
+
+    if not system_ready:
+        return jsonify({"status": "Sistem hazır değil"}), 503
+
     data = request.json
     mode = data.get("mode")
     altitude = data.get("altitude")
     target = data.get("target")
-    log(f"\U0001f4e5 Komut: Mod={mode}, İrtifa={altitude}, Hedef={target}", "info")
     hedef_etiketi = target
 
     try:
         alt = float(altitude)
-    except (ValueError, TypeError):
+    except:
         alt = 1.0
     alt = max(1.0, min(5.0, alt))
-    if current_altitude != alt:
+
+    if drone_state == "land" or current_altitude != alt:
         control.arm_and_takeoff(alt)
         current_altitude = alt
 
@@ -210,31 +219,27 @@ def reset():
     global hedef_etiketi, drone_state
     hedef_etiketi = None
     drone_state = "land"
-    log("\U0001f504 Hedef sıfırlandı", "warning")
     return jsonify({"status": "Tüm objeler izlenecek"})
 
 @app.route("/emergency", methods=["POST"])
 def emergency():
     global emergency_flag, drone_state
     emergency_flag = True
-    log("‼️ ACİL DURDURMA", "danger")
     control.stop_drone()
     drone_state = "emergency"
-    return jsonify({"status": "Drone acil durduruldu, havada asılı kaldı"})
+    return jsonify({"status": "Drone acil durduruldu"})
 
 @app.route("/resume", methods=["POST"])
 def resume():
     global emergency_flag, drone_state, current_altitude, hedef_etiketi
     emergency_flag = False
-    log("✅ Emergency modu sona erdi", "success")
 
     if hedef_etiketi:
         try:
             control.arm_and_takeoff(current_altitude)
             drone_state = "track"
             return jsonify({"status": f"Takibe devam ediliyor: {hedef_etiketi}"}), 200
-        except Exception as e:
-            log(f"Kalkış hatası: {e}", "danger")
+        except:
             return jsonify({"status": "Kalkış yapılamadı"}), 500
     else:
         land_drone()
@@ -243,7 +248,7 @@ def resume():
 
 # ---------- SETUP ----------
 def setup():
-    global picam2
+    global picam2, system_ready
     try:
         picam2 = Picamera2()
         config = picam2.create_video_configuration(
@@ -251,10 +256,9 @@ def setup():
             transform=Transform(hflip=1)
         )
         picam2.configure(config)
-        picam2.set_controls({"FrameRate": 10})
         picam2.start()
         time.sleep(2)
-        log("\U0001f4f7 Picamera2 aktif", "success")
+        log("📷 Picamera2 aktif", "success")
     except Exception as e:
         log(f"Kamera hatası: {e}", "danger")
         handle_exit()
@@ -269,9 +273,11 @@ def setup():
     control.configure_PID()
     threading.Thread(target=update_camera, daemon=True).start()
     threading.Thread(target=send_to_pc, daemon=True).start()
+    system_ready = True
+    log("🚀 Sistem hazır, komut alınabilir", "success")
 
 # ---------- MAIN ----------
 if __name__ == "__main__":
     setup()
-    log("\U0001f681 Drone sunucu başlatılıyor...", "info")
+    log("🛰️ Drone sunucu başlatıldı", "info")
     app.run(host="0.0.0.0", port=5000, threaded=True)
